@@ -1,103 +1,100 @@
-# GitHub для Claude
+# DevOps for AI
 
-Сайт + MCP-сервер в одном приложении. Пользователь входит через Google, подключает GitHub,
-создаёт ссылку и вставляет её в Claude (Settings → Connectors → Add custom connector).
+**A personal MCP server that lets an AI assistant (Claude) work with your GitHub and Railway accounts: read code, make safe multi-file commits, check CI, roll back, deploy and verify.**
 
-## Деплой на Railway
+> **This is a personal project.** I built it for my own workflow and I'm sharing it as-is. It is not a product, it is not audited, and it is not affiliated with or endorsed by Anthropic, OpenAI, GitHub or Railway. Self-host it, read the code, and use it at your own risk.
 
-1. Репозиторий с файлами `app.py`, `common.py`, `gitx.py`, `ops.py`, `main.py`, `requirements.txt`, `Procfile`, `README.md` (старый `server.py` удали).
-2. Railway → New Project → Deploy from GitHub repo.
-3. В проекте: **+ New → Database → PostgreSQL**. Затем в сервисе приложения Variables → Add Reference → `DATABASE_URL` из Postgres.
-4. Settings → Networking → **Generate Domain**. Запомни домен, он нужен ниже как `BASE_URL`.
+It is one small FastAPI app that is both a **website** (sign in, add accounts, create connector links) and an **MCP server** (Streamable HTTP). You paste a connector link into Claude (Settings, Connectors, Add custom connector) and the assistant gets ~55 tools.
 
-## OAuth-приложения
+[Русская версия ниже](#русский)
 
-**Google** (console.cloud.google.com → APIs & Services → Credentials → Create OAuth client ID → Web application):
-- Authorized redirect URI: `https://ТВОЙ_ДОМЕН/auth/google/callback`
-- Если экран согласия в режиме Testing, добавь свою почту в Test users.
+## What it does
 
-**GitHub** (github.com/settings/developers → New OAuth App):
-- Homepage URL: `https://ТВОЙ_ДОМЕН`
-- Authorization callback URL: `https://ТВОЙ_ДОМЕН/auth/github/callback`
+- **Multiple accounts.** Any number of GitHub and Railway accounts, each with a label. The assistant picks one with an `account` argument; calls to different accounts run in parallel.
+- **Per-link permissions.** Every connector link has its own rights per account: none / read-only / read-write. Links can be revoked, edited and deleted.
+- **Per-link tool sets.** Each link also chooses which groups of tools the assistant can even see (GitHub read, GitHub write, Actions, Railway read/write, advanced, deletions, checks). Fewer tools means fewer tokens and fewer wrong tool choices. Hidden tools are also blocked at call time.
+- **Safe file operations** (Git Data API, one commit for any number of files, fast-forward only, never force):
+  - `batch_commit` (text and binary files, deletions, `dry_run` shows diffs without writing)
+  - `apply_edits` (targeted old-to-new edits; any conflict means nothing is written; optional `expected_sha` check)
+  - `rollback_commit` (reverts a commit with a new commit; refuses if files changed afterwards)
+  - `upload_binary`, `batch_read_files`, `repository_tree`, `download_repository`, `compare_branches`, `commit_history_diff`
+- **CI and releases.** `workflow_status` (failed jobs plus log tail in one call), runs, jobs, logs, artifacts, releases, `release_from_artifact` (build artifact to a release with a permanent link, done server-side).
+- **Railway.** Projects, deployments, logs, variables (names only by default), set variable, redeploy, restart, `railway_service_status`, raw GraphQL.
+- **Post-deploy checks.** `run_post_deploy_tests` calls your site or API from the server (status, body text, JSON fields, latency). Private and internal addresses are blocked (SSRF protection).
+- **Confirmed deletions.** Deleting a Railway service or project, or a GitHub branch, is a two-step operation: the first call returns a plan and a one-time code, the second call with the code executes it.
+- **Tool annotations** (`readOnlyHint`, `destructiveHint`, `openWorldHint`) on every tool.
+- A generic `github_api` tool covers any other GitHub REST endpoint.
 
-## Несколько аккаунтов
+## How it works
 
-На сайте можно добавить сколько угодно аккаунтов GitHub и Railway. У каждого есть метка (например `work`, `trial2`).
+```
+Claude  --MCP over HTTPS-->  /c/<secret>/mcp  (this app)  -->  GitHub API / Railway GraphQL
+                              |
+                              +-- website: Google sign-in, accounts, links, permissions
+```
 
-- **GitHub:** кнопка «Добавить через GitHub» добавляет аккаунт, в который ты сейчас вошёл на github.com. Для другого аккаунта проще
-  «Добавить по токену»: github.com → Settings → Developer settings → Personal access tokens, права `repo`.
-- **Railway:** Account Settings → Tokens → Create token (токен аккаунта или workspace; токен проекта не поддерживается).
-  Для другого аккаунта Railway создай токен, войдя в него.
-- Если метка уже есть, токен заменяется (так обновляют просроченный). Без метки берётся логин.
-- Один аккаунт каждого типа «основной»: он используется, когда Claude не указал `account`. Сменить: «Сделать основным».
-- У каждой ссылки свои права: при создании (и позже, кнопкой «Настроить») для каждого аккаунта выбираешь
-  «Нет доступа», «Только чтение» или «Чтение и запись». Ссылка видит только выбранные аккаунты. Сама ссылка при этом не меняется.
-  Аккаунты, добавленные позже, в уже созданные ссылки не попадают: включи их через «Настроить».
-  Ссылки, созданные до обновления, видят все аккаунты (как раньше), пока ты их не настроишь.
-- В списке ссылок виден ID (#номер). Отозванную ссылку можно удалить (по одной или «Удалить все отозванные»); живую сначала отзывают.
-- Старый GitHub-токен при обновлении переносится в аккаунты автоматически.
+- Account tokens are stored **encrypted** (Fernet) in Postgres. Connector links are stored only as a **SHA-256 hash**, so a link is shown once.
+- Core is `app.py`. Extra tool modules (`gitx.py`, `ops.py`, `safe.py`, `profiles.py`) are loaded by `main.py` one by one; if one fails to import, the rest of the connector still works.
 
-Claude передаёт параметр `account` (метка или логин) в любой инструмент; `list_accounts` показывает доступные.
-Вызовы к разным аккаунтам независимы, их можно делать параллельно.
+## Quick start (Railway)
 
-## Переменные окружения (Railway → Variables)
+1. Fork or clone this repo and deploy it on Railway (**Deploy from GitHub repo**). The `Procfile` runs `uvicorn main:application`.
+2. Add a **PostgreSQL** database and reference its `DATABASE_URL` in the app service.
+3. Generate a public domain and set `BASE_URL` to it (no trailing slash).
+4. Create a **Google OAuth client** (redirect URI `https://YOUR_DOMAIN/auth/google/callback`) and a **GitHub OAuth app** (callback `https://YOUR_DOMAIN/auth/github/callback`).
+5. Set the environment variables below, open the site, sign in, add accounts, create a link, and paste it into Claude.
 
-| Переменная | Что это |
+| Variable | Meaning |
 |---|---|
-| `BASE_URL` | `https://ТВОЙ_ДОМЕН` без слеша в конце |
-| `SECRET_KEY` | любая длинная случайная строка (подпись сессий) |
-| `ENCRYPTION_KEY` | ключ Fernet: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
-| `DATABASE_URL` | ссылка на Postgres из Railway |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | из Google Cloud |
-| `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | из GitHub OAuth App |
-| `ALLOWED_EMAILS` | (необязательно) почты через запятую, кому разрешён вход. Рекомендую задать, пока сервис личный |
+| `BASE_URL` | `https://YOUR_DOMAIN`, no trailing slash |
+| `SECRET_KEY` | long random string (session signing) |
+| `ENCRYPTION_KEY` | Fernet key: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` (do not lose it) |
+| `DATABASE_URL` | Postgres URL |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth client |
+| `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | GitHub OAuth app |
+| `ALLOWED_EMAILS` | optional, comma-separated emails allowed to sign in. **Set this** unless you want anyone to be able to register |
 
-Не теряй `ENCRYPTION_KEY`: без него сохранённые GitHub-токены не расшифровать.
+GitHub accounts can be added through OAuth or with a personal access token (scope `repo`). Railway needs an account or workspace token (Account Settings, Tokens). The `mcp` package is pinned below version 2 on purpose.
 
-В `requirements.txt` закреплено `mcp<2`: в mcp 2.x `FastMCP` переименован, и этот код в нём не запустится.
+## Security model (read this)
 
-## Что умеет Claude через коннектор
+- A connector link **is a credential**. Anyone who has it can use the accounts and rights you enabled for it. Do not share it; revoke it if it leaks.
+- This app holds your GitHub and Railway tokens. Host it yourself, restrict sign-in with `ALLOWED_EMAILS`, and prefer tokens with minimal scopes.
+- Permissions are enforced on the server per link and per account; read-only links cannot write even if a tool is called by name.
+- There is **no OAuth for the MCP connection itself** (the secret link is the auth). That is fine for a personal tool, and it is why this is not suitable for a public connector directory as-is.
+- `github_api` and `railway_graphql` can do anything the underlying token allows; hide the "advanced" group on links where that is too much.
+- Confirmation codes protect against accidental one-shot deletions, not against a malicious client that chains both calls.
 
-Готовые инструменты:
-- чтение: репозитории, поиск репозиториев и кода, папки и файлы, коммиты, ветки, issues, PR (с изменёнными файлами);
-- запись: коммит файла, удаление файла, создание ветки, issue, комментарии, PR, merge PR;
-- Actions: список запусков, джобы и шаги, логи джобы, ручной запуск workflow;
-- `repo_overview`: обзор репозитория одним вызовом (ветки, коммиты, issues, PR, Actions), всё запрашивается параллельно.
+## Status and limitations
 
-Расширенные инструменты (модули `gitx.py`, `ops.py`, подключаются через `main.py`; если модуль не загрузится, остальное работает):
-- файлы и коммиты: `repository_tree` (всё дерево), `batch_read_files` (до 60 файлов за вызов), `batch_commit` (много файлов,
-  включая бинарные через base64, и удаления одним коммитом; `dry_run=true` показывает diff), `upload_binary` (файл по base64 или по ссылке до 25 МБ),
-  `apply_edits` (точечные правки old→new с проверкой конфликтов; при конфликте не пишется ничего; по умолчанию только предпросмотр);
-- история: `compare_branches`, `commit_history_diff` (коммиты + CI, подсказывает «подозреваемый» коммит), `rollback_commit`
-  (безопасный откат новым коммитом; если файл менялся позже, откат не выполняется), `download_repository` (временная ссылка на ZIP + текстовый дамп);
-- сборки и релизы: `workflow_status` (упавшие джобы и хвост логов), `list_artifacts`, `download_artifact`, `list_releases`, `create_release`,
-  `upload_release_asset`, `release_from_artifact` (APK из Actions → релиз с постоянной ссылкой, всё делает сервер);
-- Railway: `railway_service_status` (деплои + хвост логов одним вызовом).
-Ветка двигается только вперёд (без force). Файлы APK/ZIP в чат Claude не передаются: он получает ссылки.
+- Used daily by the author on a few accounts. Core read and write tools, multi-account, per-link permissions, tool sets, batch commits, edits and rollback were exercised against the real GitHub API.
+- Release/artifact tools, post-deploy checks and the deletion tools are covered by tests against mocked services; they have had less real-world use, so expect rough edges.
+- No automated test suite is included in this repo yet.
+- Large binaries (APK/ZIP) are never passed through the chat: the server hands out temporary or permanent links instead.
 
-Railway (если на сайте добавлен API-токен):
-- `railway_projects`: проекты, окружения и сервисы с их id (с этого начинается работа);
-- `railway_deployments`, `railway_logs` (логи деплоя или сборки), `railway_variables` (по умолчанию только имена, значения скрыты);
-- запись: `railway_set_variable`, `railway_redeploy`, `railway_restart` (в режиме «только чтение» заблокированы);
-- `railway_graphql`: любой запрос к GraphQL API Railway, `railway_schema`: просмотр живой схемы API.
+Issues and pull requests are welcome, but this is a hobby project, so replies may be slow.
 
-`list_accounts`: аккаунты, доступные этой ссылке, и уровень доступа к каждому.
+## License
 
-Плюс универсальный `github_api(method, path, params, body)`: любой эндпоинт GitHub REST API
-(релизы, ревью, лейблы, настройки и т.д.). В режиме «только чтение» разрешён только GET.
+MIT, see [LICENSE](LICENSE).
 
-Права ограничены тем, что дал OAuth-токен (скоуп `repo` или `public_repo`). Удалить репозиторий
-через него нельзя: скоуп `delete_repo` не запрашивается.
+---
 
-## Скорость
+## Русский
 
-- Один общий HTTP-клиент к GitHub: соединения переиспользуются, а не открываются заново на каждый вызов.
-- Токен аккаунта кэшируется в памяти на 30 секунд (сбрасывается сразу при отзыве ссылки или смене аккаунтов), поэтому обычный вызов не ходит в базу.
-- Время «последнее использование» пишется не чаще раза в 5 минут.
-- Если всё равно медленно: в Railway проверь, что приложение и Postgres в одном регионе и что у сервиса не включён сон при простое.
+**DevOps для ИИ: личный MCP-сервер, через который Claude работает с твоими GitHub и Railway.** Читает код, делает безопасные коммиты сразу многих файлов, смотрит сборки и логи, откатывает изменения, проверяет сайт после деплоя.
 
-## Как это работает
+> **Это личный проект.** Я сделал его для себя и выкладываю как есть: без аудита и без гарантий, к Anthropic, OpenAI, GitHub и Railway он отношения не имеет. Разворачивай у себя, читай код и пользуйся на свой риск.
 
-- Токены аккаунтов хранятся в базе зашифрованными (Fernet).
-- Ссылка коннектора вида `https://ДОМЕН/c/<секрет>/mcp`. В базе лежит только её хеш, поэтому ссылка показывается один раз.
-- Ссылку можно отозвать в панели; на аккаунтах с доступом «только чтение» запись блокируется (коммиты, issues, PR, Railway).
+**Что умеет**
+- Любое число аккаунтов GitHub и Railway, у каждого своя метка.
+- Права у каждой ссылки свои: по каждому аккаунту нет доступа, только чтение или чтение и запись. А ещё для каждой ссылки выбирается набор инструментов, которые видит Claude (меньше инструментов: меньше токенов и путаницы).
+- Массовые коммиты одним запросом, точечные правки с проверкой конфликтов (при конфликте не пишется ничего), предпросмотр изменений, безопасный откат новым коммитом.
+- Статус сборок и логи упавших джобов одним вызовом, релизы из артефактов сборки, состояние сервисов Railway, проверка сайта после деплоя.
+- Удаление сервисов, проектов и веток только в два шага: сначала план и одноразовый код, потом выполнение.
+
+**Запуск:** разверни на Railway (подключи Postgres, задай переменные из таблицы выше, создай OAuth-приложения Google и GitHub), войди на сайт, добавь аккаунты, создай ссылку и вставь её в Claude (Settings, Connectors, Add custom connector).
+
+**Безопасность:** ссылка коннектора это пароль, никому её не давай. Токены аккаунтов хранятся зашифрованными, ссылки только в виде хеша. Обязательно задай `ALLOWED_EMAILS`, иначе зарегистрироваться сможет любой.
+
+**Статус:** хобби-проект. Основное проверено на реальном GitHub; релизы, проверки после деплоя и удаления проверены только на имитации, возможны шероховатости.
